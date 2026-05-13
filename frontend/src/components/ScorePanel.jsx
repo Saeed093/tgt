@@ -1,26 +1,30 @@
+function formatOffset(val) {
+  if (val == null) return "—";
+  return (val >= 0 ? "+" : "") + val;
+}
+
 export default function ScorePanel({
   tries,
-  lastScore,
-  totalScore,
+  hits,
+  misses,
   hitDetected,
   stable,
   systemRunning,
+  offsetFromCenter,
 }) {
   const statusText = !systemRunning
     ? "OFFLINE"
     : hitDetected
     ? "HIT"
-    : stable
-    ? "READY"
-    : "MOTION";
+    : "READY";
 
   const statusCls = !systemRunning
     ? "stat-off"
     : hitDetected
     ? "stat-hit"
-    : stable
-    ? "stat-ready"
-    : "stat-warn";
+    : "stat-ready";
+
+  const hasOffset = Array.isArray(offsetFromCenter) && offsetFromCenter.length >= 2;
 
   return (
     <section className="panel score-panel">
@@ -29,15 +33,23 @@ export default function ScorePanel({
         <span className="score-value">{String(tries).padStart(3, "0")}</span>
       </div>
       <div className="score-cell">
-        <span className="score-label">LAST</span>
+        <span className="score-label">HITS</span>
         <span className="score-value accent">
-          {String(lastScore).padStart(2, "0")}
+          {String(hits).padStart(3, "0")}
         </span>
       </div>
       <div className="score-cell">
-        <span className="score-label">TOTAL</span>
+        <span className="score-label">MISSES</span>
         <span className="score-value big">
-          {String(totalScore).padStart(3, "0")}
+          {String(misses).padStart(3, "0")}
+        </span>
+      </div>
+      <div className="score-cell">
+        <span className="score-label">OFFSET</span>
+        <span className="score-value offset-value">
+          {hasOffset
+            ? `${formatOffset(offsetFromCenter[0])}, ${formatOffset(offsetFromCenter[1])}`
+            : "—"}
         </span>
       </div>
       <div className="score-cell">

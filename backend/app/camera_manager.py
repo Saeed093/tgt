@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -29,6 +31,11 @@ RES_CANDIDATES = [
 MOTION_STILL_THRESHOLD = 2.5
 STABLE_DWELL_SEC = 1.5
 HIT_COOLDOWN_SEC = 1.0
+
+# Live WebSocket feed: downscale large frames before JPEG to reduce macroblocking.
+STREAM_MAX_EDGE = 1280
+STREAM_JPEG_QUALITY = 84
+DISK_JPEG_QUALITY = 93
 
 
 class CameraManager:
@@ -83,6 +90,7 @@ class CameraManager:
         self.latest_payload = None
         self.last_hit_ts = 0.0
         self._sticky_boxes = None
+        self._last_hit_detail = None
         self.actual_resolution = ""
         self.motion = 0.0
         self.stable = False
@@ -116,12 +124,12 @@ class CameraManager:
         self.reference_saved = False
         self.target_type = "unknown"
         self._sticky_boxes = None
+        self._last_hit_detail = None
         self.actual_resolution = ""
         self.motion = 0.0
         self.stable = False
         self._prev_gray_small = None
         self._manual_check_pending = False
-        self.session_manager.cleanup_current_session()
         self._publish_idle_feed()
         log.info("Camera stopped")
         return True, "Camera stopped"
@@ -144,6 +152,8 @@ class CameraManager:
             "target_mode": self.target_mode,
             "target_type": self.target_type,
             "tries": state.tries,
+            "hits": state.hits,
+            "misses": state.misses,
             "last_score": state.last_score,
             "total_score": state.total_score,
             "hit_detected": (state.hit_status == "hit"),
@@ -349,10 +359,23 @@ class CameraManager:
     # ------------------------------------------------------------------
 
     def _encode_frame(self, frame) -> str:
+        h, w = frame.shape[:2]
+        m = max(h, w)
+        to_encode = frame
+        if m > STREAM_MAX_EDGE:
+            scale = STREAM_MAX_EDGE / float(m)
+            nw = max(1, int(w * scale))
+            nh = max(1, int(h * scale))
+            to_encode = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
         ok, jpeg = cv2.imencode(
             ".jpg",
-            frame,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 92, int(cv2.IMWRITE_JPEG_OPTIMIZE), 1],
+            to_encode,
+            [
+                int(cv2.IMWRITE_JPEG_QUALITY),
+                STREAM_JPEG_QUALITY,
+                int(cv2.IMWRITE_JPEG_OPTIMIZE),
+                1,
+            ],
         )
         if not ok:
             return ""
@@ -365,11 +388,42 @@ class CameraManager:
 
     def _save_hit_images(self, frame, annotated, tries: int) -> None:
         hit_path = self.session_manager.path_for(f"hit_{tries:03d}.jpg")
+        annotated_path = self.session_manager.path_for(f"hit_{tries:03d}_annotated.jpg")
         latest_path = self.session_manager.path_for("annotated_latest.jpg")
+        jpg_opts = [int(cv2.IMWRITE_JPEG_QUALITY), DISK_JPEG_QUALITY]
         if hit_path:
-            cv2.imwrite(str(hit_path), frame)
+            cv2.imwrite(str(hit_path), frame, jpg_opts)
+        if annotated_path:
+            cv2.imwrite(str(annotated_path), annotated, jpg_opts)
         if latest_path:
-            cv2.imwrite(str(latest_path), annotated)
+            cv2.imwrite(str(latest_path), annotated, jpg_opts)
+
+    def _save_hit_data(self, detection: dict, hit_result: dict, tries: int) -> None:
+        record = {
+            "try": tries,
+            "bbox": detection["bbox"],
+            "center_px": hit_result["hit_center_px"],
+            "target_center_px": hit_result["target_center_px"],
+            "offset_from_center_px": hit_result["offset_px"],
+            "offset_from_center_norm": hit_result["offset_norm"],
+            "score": hit_result["score"],
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+
+        per_hit = self.session_manager.path_for(f"hit_{tries:03d}.json")
+        if per_hit:
+            per_hit.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+        summary = self.session_manager.path_for("session_hits.json")
+        if summary:
+            existing: list = []
+            if summary.exists():
+                try:
+                    existing = json.loads(summary.read_text(encoding="utf-8"))
+                except Exception:
+                    existing = []
+            existing.append(record)
+            summary.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
     # ------------------------------------------------------------------
     # Payload publishing
@@ -387,9 +441,14 @@ class CameraManager:
             "last_score": state.last_score,
             "total_score": state.total_score,
             "tries": state.tries,
+            "hits": state.hits,
+            "misses": state.misses,
             "actual_resolution": self.actual_resolution,
             "motion": round(float(self.motion), 3),
             "stable": bool(self.stable),
+            "hit_center": state.last_hit_center,
+            "target_center": state.last_target_center,
+            "offset_from_center": state.last_offset_px,
         }
         with self._lock:
             self.latest_payload = payload
@@ -406,9 +465,14 @@ class CameraManager:
                 "last_score": state.last_score,
                 "total_score": state.total_score,
                 "tries": state.tries,
+                "hits": state.hits,
+                "misses": state.misses,
                 "actual_resolution": "",
                 "motion": 0.0,
                 "stable": False,
+                "hit_center": None,
+                "target_center": None,
+                "offset_from_center": None,
             }
 
     # ------------------------------------------------------------------
@@ -533,20 +597,50 @@ class CameraManager:
             self._last_motion_ts = time.time()
             log.info("Monitoring started  |  target=%s  |  res=%s", self.target_type, self.actual_resolution)
 
+            frame_counter = 0
+            _consecutive_failures = 0
+            _MAX_FAILURES_BEFORE_RECONNECT = 15
+
             while self.running:
                 ok, frame = self._safe_read(self.capture)
                 if not ok or frame is None:
+                    _consecutive_failures += 1
                     self.status = "camera_read_error"
                     self._push_payload()
-                    time.sleep(0.2)
+                    if _consecutive_failures >= _MAX_FAILURES_BEFORE_RECONNECT:
+                        log.warning(
+                            "Camera: %d consecutive read failures — attempting reconnect ...",
+                            _consecutive_failures,
+                        )
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                        new_cap = self._open_camera(self.camera_source or "0")
+                        if new_cap is not None:
+                            cap = new_cap
+                            self.capture = cap
+                            _consecutive_failures = 0
+                            self.status = "monitoring"
+                            log.info("Camera reconnected successfully.")
+                        else:
+                            log.error("Reconnect failed — will retry.")
+                            _consecutive_failures = 0
+                    else:
+                        time.sleep(0.2)
                     continue
 
+                _consecutive_failures = 0
+
                 now = time.time()
-                self.motion = self._update_motion(frame)
-                if self.motion > MOTION_STILL_THRESHOLD:
-                    self._last_motion_ts = now
-                still_for = now - self._last_motion_ts
-                self.stable = still_for >= STABLE_DWELL_SEC
+                frame_counter += 1
+                if frame_counter % 3 == 0:
+                    self.motion = self._update_motion(frame)
+                    if self.motion > MOTION_STILL_THRESHOLD:
+                        self._last_motion_ts = now
+                    still_for = now - self._last_motion_ts
+                    self.stable = still_for >= STABLE_DWELL_SEC
 
                 annotated = frame.copy()
                 hit_detected = False
@@ -558,9 +652,7 @@ class CameraManager:
                         best = hits[0]
                         hit_detected = True
                         bbox_entry = list(map(int, best["bbox"]))
-                        if self._sticky_boxes is None:
-                            self._sticky_boxes = []
-                        self._sticky_boxes.append(bbox_entry)
+                        self._sticky_boxes = [bbox_entry]
                         center = tuple(best["center"])
                         hit_result = self.score_engine.score_hit(
                             center, frame.shape, self.target_type
@@ -574,6 +666,14 @@ class CameraManager:
                             best["bbox"], best["center"], score,
                             self.score_engine.state.total_score,
                             hit_result["offset_px"][0], hit_result["offset_px"][1],
+                        )
+                    else:
+                        self.score_engine.record_miss()
+                        self.reference_frame = frame.copy()
+                        log.info(
+                            "MISS  tries=%d  misses=%d",
+                            self.score_engine.state.tries,
+                            self.score_engine.state.misses,
                         )
 
                 if self._sticky_boxes:

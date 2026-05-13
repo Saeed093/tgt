@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
+
+_SESSION_DIR_RE = re.compile(r"^session_\d{8}_\d{6}$")
 
 
 class SessionManager:
@@ -32,3 +35,22 @@ class SessionManager:
         if not self.current_session_dir:
             return None
         return self.current_session_dir / filename
+
+    def list_gallery_sessions(self) -> list[dict]:
+        """List session folders under root_dir with image files (newest first)."""
+        if not self.root_dir.exists():
+            return []
+        out: list[dict] = []
+        for p in sorted(self.root_dir.iterdir(), key=lambda x: x.name, reverse=True):
+            if not p.is_dir() or not _SESSION_DIR_RE.match(p.name):
+                continue
+            imgs = [
+                f.name
+                for f in p.iterdir()
+                if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg")
+            ]
+            if not imgs:
+                continue
+            imgs.sort(key=lambda n: (0 if "_annotated" in n else 1, n))
+            out.append({"id": p.name, "files": imgs})
+        return out

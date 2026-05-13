@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import CameraPanel from "./components/CameraPanel";
 import ControlPanel from "./components/ControlPanel";
+import SavedHitsGallery from "./components/SavedHitsGallery";
 import ScorePanel from "./components/ScorePanel";
 import StatusBar from "./components/StatusBar";
 
@@ -9,6 +10,7 @@ const WS_URL = import.meta.env.VITE_WS_URL ?? "ws://localhost:8080/ws";
 const WS_RECONNECT_MS = 2000;
 
 const IP_CAM_STORAGE_KEY = "target-hit-ip-cameras";
+const LAST_CAMERA_SOURCE_KEY = "target-hit-last-camera-source";
 
 const fallbackCameras = [
   { index: 0, label: "Camera 0" },
@@ -48,6 +50,18 @@ function loadSavedIpCameras() {
   }
 }
 
+function loadLastCameraSource() {
+  try {
+    const s = localStorage.getItem(LAST_CAMERA_SOURCE_KEY)?.trim();
+    if (!s) return "0";
+    if (/^[0-9]+$/.test(s)) return s;
+    if (isStreamUrl(s)) return s;
+  } catch {
+    /* ignore */
+  }
+  return "0";
+}
+
 const initialFeed = {
   frame: "",
   target_type: "unknown",
@@ -57,19 +71,25 @@ const initialFeed = {
   last_score: 0,
   total_score: 0,
   tries: 0,
+  hits: 0,
+  misses: 0,
   actual_resolution: "",
   motion: 0,
   stable: false,
+  hit_center: null,
+  target_center: null,
+  offset_from_center: null,
 };
 
 export default function App() {
-  const [cameraSource, setCameraSource] = useState("0");
+  const [cameraSource, setCameraSource] = useState(loadLastCameraSource);
   const [webcams, setWebcams] = useState(fallbackCameras);
   const [savedIpCameras, setSavedIpCameras] = useState(loadSavedIpCameras);
   const [targetMode, setTargetMode] = useState("auto");
   const [busy, setBusy] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [feed, setFeed] = useState(initialFeed);
+  const [galleryOpen, setGalleryOpen] = useState(false);
   const wsRef = useRef(null);
   const reconnectRef = useRef(null);
 
@@ -130,6 +150,24 @@ export default function App() {
       /* ignore quota / private mode */
     }
   }, [savedIpCameras]);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      try {
+        const s = String(cameraSource).trim();
+        if (s === "" || s === "0") {
+          localStorage.setItem(LAST_CAMERA_SOURCE_KEY, "0");
+          return;
+        }
+        if (/^[0-9]+$/.test(s) || isStreamUrl(s)) {
+          localStorage.setItem(LAST_CAMERA_SOURCE_KEY, s);
+        }
+      } catch {
+        /* ignore */
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [cameraSource]);
 
   const addIpCamera = (name, url) => {
     const u = url.trim();
@@ -204,6 +242,13 @@ export default function App() {
           motion={feed.motion}
           systemRunning={systemRunning}
         />
+        <button
+          type="button"
+          className="ghost header-gallery-btn"
+          onClick={() => setGalleryOpen(true)}
+        >
+          SAVED HITS
+        </button>
       </header>
 
       <div className="layout">
@@ -233,6 +278,9 @@ export default function App() {
                 actual_resolution: "",
                 motion: 0,
                 stable: false,
+                hit_center: null,
+                target_center: null,
+                offset_from_center: null,
               }));
             }
           }}
@@ -249,16 +297,24 @@ export default function App() {
           stable={feed.stable}
           hitDetected={feed.hit_detected}
           targetType={feed.target_type}
+          offsetFromCenter={feed.offset_from_center}
         />
       </div>
 
       <ScorePanel
         tries={feed.tries}
-        lastScore={feed.last_score}
-        totalScore={feed.total_score}
+        hits={feed.hits}
+        misses={feed.misses}
         hitDetected={feed.hit_detected}
         stable={feed.stable}
         systemRunning={systemRunning}
+        offsetFromCenter={feed.offset_from_center}
+      />
+
+      <SavedHitsGallery
+        open={galleryOpen}
+        onClose={() => setGalleryOpen(false)}
+        apiBase={API_BASE}
       />
     </main>
   );

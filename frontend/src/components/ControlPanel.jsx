@@ -153,6 +153,9 @@ export default function ControlPanel({
 
         <label className="field">
           <span className="field-label">SOURCE / URL</span>
+          <p className="field-hint">
+            Last USB index or stream URL is remembered in this browser.
+          </p>
           <input
             value={source}
             onChange={(e) => {

@@ -18,6 +18,11 @@ function targetLabel(t) {
   return "UNKNOWN";
 }
 
+function formatOffset(val) {
+  if (val == null) return "—";
+  return (val >= 0 ? "+" : "") + val;
+}
+
 export default function CameraPanel({
   frame,
   status,
@@ -26,6 +31,7 @@ export default function CameraPanel({
   stable,
   hitDetected,
   targetType,
+  offsetFromCenter,
 }) {
   const message = statusMessages[status] || status?.toUpperCase() || "";
   const motionPct = Math.min(100, Math.round((motion || 0) * 12));
@@ -42,10 +48,10 @@ export default function CameraPanel({
   }, [hitDetected]);
 
   const stateChip = status === "monitoring"
-    ? stable
-      ? { text: "STABLE  //  CHECKING", cls: "chip chip-ok" }
-      : { text: "MOTION  //  WAITING", cls: "chip chip-warn" }
+    ? { text: "READY  //  PRESS CHECK", cls: "chip chip-ok" }
     : { text: message, cls: "chip chip-info" };
+
+  const hasOffset = Array.isArray(offsetFromCenter) && offsetFromCenter.length >= 2;
 
   return (
     <section className={`panel camera-panel${hitFlash ? " hit-pulse" : ""}`}>
@@ -99,6 +105,14 @@ export default function CameraPanel({
         </div>
 
         {hitFlash && <div className="hit-overlay">HIT REGISTERED</div>}
+
+        {hasOffset && (
+          <div className="hud-bottom-left">
+            <span className="chip chip-offset">
+              OFFSET: {formatOffset(offsetFromCenter[0])}px , {formatOffset(offsetFromCenter[1])}px
+            </span>
+          </div>
+        )}
       </div>
     </section>
   );
