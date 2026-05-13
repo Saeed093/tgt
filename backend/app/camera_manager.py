@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+import queue
 import sys
 import threading
 import time
@@ -37,6 +38,89 @@ STREAM_MAX_EDGE = 1280
 STREAM_JPEG_QUALITY = 84
 DISK_JPEG_QUALITY = 93
 
+# Network-stream reader tuning.
+NETWORK_READ_TIMEOUT_SEC = 4.0          # block in main loop waiting for a fresh frame
+NETWORK_RECONNECT_AFTER_SEC = 3.0       # if reader sees no frame for this long → reconnect
+NETWORK_RECONNECT_BACKOFF_SEC = 1.5
+
+
+class _NetworkFrameReader:
+    """Continuously drains an RTSP / HTTP VideoCapture in a background thread.
+
+    For network streams, OpenCV/FFmpeg buffers frames internally.  If the
+    consumer (our processing loop) is slower than the camera's frame rate
+    even slightly, that internal buffer fills up and ``cap.read()`` starts
+    returning stale frames in bursts — visible as freezing followed by
+    fast-forward stutters, and as macroblock 'pixelation' when partially
+    decoded packets are flushed.
+
+    This reader keeps the buffer drained by reading flat-out in a thread
+    and exposing **only the most recent decoded frame** via a 1-slot
+    queue.  The processing loop is then always operating on near-realtime
+    frames and never blocks the camera.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        self._cap = cap
+        self._q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=1)
+        self._running = True
+        self._stat_lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._last_frame_ts = time.time()
+        self._frames_total = 0
+        self._thread = threading.Thread(
+            target=self._loop, name="ip-cam-reader", daemon=True
+        )
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                ok, frame = self._cap.read()
+            except Exception:
+                ok, frame = False, None
+
+            if not ok or frame is None or getattr(frame, "size", 0) == 0:
+                with self._stat_lock:
+                    self._consecutive_failures += 1
+                time.sleep(0.02)
+                continue
+
+            with self._stat_lock:
+                self._consecutive_failures = 0
+                self._last_frame_ts = time.time()
+                self._frames_total += 1
+
+            if self._q.full():
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                self._q.put_nowait(frame)
+            except queue.Full:
+                pass
+
+    def read(self, timeout: float = NETWORK_READ_TIMEOUT_SEC):
+        try:
+            frame = self._q.get(timeout=timeout)
+            return True, frame
+        except queue.Empty:
+            return False, None
+
+    def seconds_since_last_frame(self) -> float:
+        with self._stat_lock:
+            return time.time() - self._last_frame_ts
+
+    def consecutive_failures(self) -> int:
+        with self._stat_lock:
+            return self._consecutive_failures
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
 
 class CameraManager:
     def __init__(self, app_root: Path) -> None:
@@ -47,6 +131,7 @@ class CameraManager:
         self.session_manager = SessionManager(app_root.parent / "temp")
 
         self.capture = None
+        self._stream_reader: _NetworkFrameReader | None = None
         self.running = False
         self.status = "idle"
         self.camera_source: str | None = None
@@ -109,6 +194,13 @@ class CameraManager:
     def stop(self) -> tuple[bool, str]:
         self.running = False
 
+        if self._stream_reader is not None:
+            try:
+                self._stream_reader.stop()
+            except Exception:
+                pass
+            self._stream_reader = None
+
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=8)
 
@@ -163,8 +255,19 @@ class CameraManager:
         }
 
     def get_latest_payload(self) -> dict | None:
+        """Return latest payload, encoding the BGR frame on demand.
+
+        Encoding here (instead of inside the capture loop) means the
+        capture thread is never blocked behind cv2.imencode / base64.
+        It also caps real JPEG work to the WebSocket send rate.
+        """
         with self._lock:
-            return self.latest_payload
+            if self.latest_payload is None:
+                return None
+            payload = dict(self.latest_payload)
+            frame = payload.pop("_frame_bgr", None)
+        payload["frame"] = self._encode_frame(frame) if frame is not None else ""
+        return payload
 
     # ------------------------------------------------------------------
     # Camera open helpers
@@ -210,16 +313,49 @@ class CameraManager:
         self._negotiate_resolution(cap, is_stream=self._is_network_stream(parsed))
         return cap
 
+    def _configure_ffmpeg_for(self, url: str) -> None:
+        """Apply the right FFmpeg capture options for the given URL scheme.
+
+        IMPORTANT: we **assign** the env var (not setdefault), because
+        OpenCV reads it at ``VideoCapture()`` construction time and we
+        may be opening a different camera type than last time.
+        """
+        lower = url.strip().lower()
+        if lower.startswith(("rtsp://", "rtsps://")):
+            opts = (
+                # TCP transport survives NAT / firewalls / wifi jitter far
+                # better than UDP and is the main fix for "pixelation".
+                "rtsp_transport;tcp"
+                # Detect a dead socket within 5s instead of blocking forever.
+                "|stimeout;5000000"
+                # ~1s jitter buffer — smooths bursty arrivals into clean playback.
+                "|max_delay;1000000"
+                # Don't reorder, we want frames as soon as they arrive.
+                "|reorder_queue_size;0"
+                # Larger UDP socket buffer for the rare UDP fallback.
+                "|buffer_size;1048576"
+                # Probe size & analyzeduration kept small to start fast.
+                "|analyzeduration;1000000"
+                "|probesize;500000"
+            )
+        elif lower.startswith(("http://", "https://")):
+            # MJPEG / HLS / generic HTTP: auto-reconnect on transient drops.
+            opts = (
+                "reconnect;1"
+                "|reconnect_streamed;1"
+                "|reconnect_delay_max;5"
+                "|stimeout;5000000"
+            )
+        else:
+            opts = "stimeout;5000000"
+
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = opts
+        log.info("FFmpeg capture options set: %s", opts)
+
     def _open_network_stream(self, url: str) -> cv2.VideoCapture | None:
         """Open RTSP / HTTP(S) / other URL streams (IP cameras)."""
         log.info("Opening stream URL: %s", url)
-        lower = url.lower()
-        if lower.startswith("rtsp://") or lower.startswith("rtsps://"):
-            # TCP transport is more reliable than UDP through NAT/firewalls.
-            os.environ.setdefault(
-                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-                "rtsp_transport;tcp|max_delay;500000",
-            )
+        self._configure_ffmpeg_for(url)
 
         cap: cv2.VideoCapture | None = None
         try:
@@ -230,32 +366,42 @@ class CameraManager:
         except Exception:
             cap = None
 
-        if cap and cap.isOpened():
+        if not (cap and cap.isOpened()):
+            if cap:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
             try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap = cv2.VideoCapture(url)
             except Exception:
-                pass
-            return cap
+                return None
 
-        if cap:
-            try:
+        if not (cap and cap.isOpened()):
+            if cap:
                 cap.release()
-            except Exception:
-                pass
-
-        try:
-            cap = cv2.VideoCapture(url)
-        except Exception:
             return None
-        if cap and cap.isOpened():
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
-            return cap
-        if cap:
-            cap.release()
-        return None
+
+        # Keep the OpenCV-side queue as short as possible so even if the
+        # FFmpeg backend buffers, OpenCV itself doesn't.
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        # Best-effort open/read timeouts (supported on newer OpenCV builds).
+        for prop_name, value_ms in (
+            ("CAP_PROP_OPEN_TIMEOUT_MSEC", 5000),
+            ("CAP_PROP_READ_TIMEOUT_MSEC", 5000),
+        ):
+            prop = getattr(cv2, prop_name, None)
+            if prop is not None:
+                try:
+                    cap.set(prop, value_ms)
+                except Exception:
+                    pass
+
+        return cap
 
     def _open_usb(self, index: int) -> cv2.VideoCapture | None:
         """Open a USB camera. On Windows use DSHOW first — it starts faster and
@@ -431,9 +577,8 @@ class CameraManager:
 
     def _push_payload(self, frame=None, hit_detected=False, bbox=None) -> None:
         state = self.score_engine.state
-        encoded = self._encode_frame(frame) if frame is not None else ""
         payload = {
-            "frame": encoded,
+            "_frame_bgr": frame,
             "target_type": self.target_type,
             "status": self.status,
             "hit_detected": hit_detected,
@@ -457,7 +602,7 @@ class CameraManager:
         state = self.score_engine.state
         with self._lock:
             self.latest_payload = {
-                "frame": "",
+                "_frame_bgr": None,
                 "target_type": "unknown",
                 "status": "idle",
                 "hit_detected": False,
@@ -504,6 +649,13 @@ class CameraManager:
     # Processing thread
     # ------------------------------------------------------------------
 
+    def _pipeline_read(self):
+        """Read the next frame, using the threaded reader for network streams."""
+        reader = self._stream_reader  # local ref — safe under stop() races
+        if reader is not None:
+            return reader.read(timeout=NETWORK_READ_TIMEOUT_SEC)
+        return self._safe_read(self.capture)
+
     def _capture_stable_reference(self, max_wait_sec: float = 8.0) -> np.ndarray | None:
         self.status = "capturing reference"
         log.info("Capturing stable reference (hold still) ...")
@@ -514,7 +666,7 @@ class CameraManager:
         prev_small: np.ndarray | None = None
 
         while self.running and kept < target_frames and time.time() < deadline:
-            ok, frame = self._safe_read(self.capture)
+            ok, frame = self._pipeline_read()
             if not ok or frame is None:
                 time.sleep(0.03)
                 continue
@@ -550,6 +702,25 @@ class CameraManager:
         log.info("Reference captured (%d averaged frames)", kept)
         return (accum / kept).astype(np.uint8)
 
+    def _start_stream_reader_if_network(self, cap: cv2.VideoCapture) -> None:
+        """If the current source is a network stream, wrap cap in a threaded reader.
+
+        This is the main fix for IP-camera 'cut/stutter/pixelation': the
+        reader keeps the FFmpeg backlog drained so we never process stale
+        frames, and the consumer (this thread) never has to wait on I/O.
+        """
+        if self._stream_reader is not None:
+            try:
+                self._stream_reader.stop()
+            except Exception:
+                pass
+            self._stream_reader = None
+
+        parsed = self._parse_source(self.camera_source or "")
+        if self._is_network_stream(parsed):
+            log.info("Starting threaded reader for network stream")
+            self._stream_reader = _NetworkFrameReader(cap)
+
     def _process_loop(self) -> None:
         cap: cv2.VideoCapture | None = None
         try:
@@ -562,12 +733,13 @@ class CameraManager:
                 return
 
             self.capture = cap
+            self._start_stream_reader_if_network(cap)
             self.status = "warming up"
             log.info("Camera opened  |  resolution: %s  |  warming up ...", self.actual_resolution)
 
             warmup_start = time.time()
             while self.running and (time.time() - warmup_start) < 2.0:
-                ok, frame = self._safe_read(self.capture)
+                ok, frame = self._pipeline_read()
                 if ok and frame is not None:
                     self.motion = self._update_motion(frame)
                     self._push_payload(frame)
@@ -602,25 +774,47 @@ class CameraManager:
             _MAX_FAILURES_BEFORE_RECONNECT = 15
 
             while self.running:
-                ok, frame = self._safe_read(self.capture)
-                if not ok or frame is None:
+                ok, frame = self._pipeline_read()
+
+                # For network streams, the reader may still be alive but
+                # not producing frames (camera unplugged, network blip).
+                # Trip a reconnect if we've gone too long without one.
+                stream_stale = (
+                    self._stream_reader is not None
+                    and self._stream_reader.seconds_since_last_frame()
+                    > NETWORK_RECONNECT_AFTER_SEC
+                )
+
+                if not ok or frame is None or stream_stale:
                     _consecutive_failures += 1
                     self.status = "camera_read_error"
                     self._push_payload()
-                    if _consecutive_failures >= _MAX_FAILURES_BEFORE_RECONNECT:
+
+                    needs_reconnect = (
+                        stream_stale
+                        or _consecutive_failures >= _MAX_FAILURES_BEFORE_RECONNECT
+                    )
+                    if needs_reconnect:
                         log.warning(
-                            "Camera: %d consecutive read failures — attempting reconnect ...",
-                            _consecutive_failures,
+                            "Camera read stalled (failures=%d, stale=%s) — reconnecting ...",
+                            _consecutive_failures, stream_stale,
                         )
+                        if self._stream_reader is not None:
+                            try:
+                                self._stream_reader.stop()
+                            except Exception:
+                                pass
+                            self._stream_reader = None
                         try:
                             cap.release()
                         except Exception:
                             pass
-                        time.sleep(1.5)
+                        time.sleep(NETWORK_RECONNECT_BACKOFF_SEC)
                         new_cap = self._open_camera(self.camera_source or "0")
                         if new_cap is not None:
                             cap = new_cap
                             self.capture = cap
+                            self._start_stream_reader_if_network(cap)
                             _consecutive_failures = 0
                             self.status = "monitoring"
                             log.info("Camera reconnected successfully.")
@@ -697,12 +891,25 @@ class CameraManager:
 
                 sticky_primary = self._sticky_boxes[-1] if self._sticky_boxes else None
                 self._push_payload(annotated, hit_detected, sticky_primary)
-                time.sleep(0.03)
+
+                # USB cameras need a small sleep so we don't busy-loop the CPU.
+                # Network streams are already paced by the threaded reader
+                # (we block on its queue), so adding a sleep there would
+                # cause the FFmpeg buffer to fill — exactly the bug that
+                # produced 'cuts and pixelation'. Don't sleep there.
+                if self._stream_reader is None:
+                    time.sleep(0.03)
         except Exception:
             log.exception("Unexpected error in _process_loop")
             self.status = "error: internal"
             self._push_payload()
         finally:
+            if self._stream_reader is not None:
+                try:
+                    self._stream_reader.stop()
+                except Exception:
+                    pass
+                self._stream_reader = None
             if cap is not None:
                 try:
                     cap.release()
