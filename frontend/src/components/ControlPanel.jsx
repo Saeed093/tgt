@@ -1,5 +1,10 @@
 import { useState } from "react";
 
+function formatOffset(val) {
+  if (val == null) return "—";
+  return (val >= 0 ? "+" : "") + val;
+}
+
 export default function ControlPanel({
   source,
   webcams,
@@ -15,6 +20,7 @@ export default function ControlPanel({
   onCheckNow,
   busy,
   systemRunning,
+  allHits,
 }) {
   const [ipName, setIpName] = useState("");
   const [ipUrl, setIpUrl] = useState("");
@@ -181,6 +187,36 @@ export default function ControlPanel({
           </select>
         </label>
       </div>
+
+      {Array.isArray(allHits) && allHits.length > 0 && (
+        <div className="hits-in-panel">
+          <div className="hits-in-panel-header">
+            <span className="hits-in-panel-title">DETECTED HITS</span>
+            <span className="chip chip-ok">{allHits.length} HIT{allHits.length !== 1 ? "S" : ""}</span>
+            <span className="hits-in-panel-total">
+              {allHits.reduce((s, h) => s + (h.score ?? 0), 0)} PTS
+            </span>
+          </div>
+          <div className="hits-in-panel-list">
+            {allHits.map((h) => {
+              const cx = Array.isArray(h.center) ? h.center[0] : "—";
+              const cy = Array.isArray(h.center) ? h.center[1] : "—";
+              const ox = Array.isArray(h.offset_px) ? h.offset_px[0] : null;
+              const oy = Array.isArray(h.offset_px) ? h.offset_px[1] : null;
+              return (
+                <div key={h.index} className="hit-row">
+                  <span className="hit-row-index">#{h.index}</span>
+                  <span className="hit-row-coord">({cx}, {cy})</span>
+                  <span className="hit-row-offset">{formatOffset(ox)}, {formatOffset(oy)}</span>
+                  <span className={`hit-row-score${h.score > 0 ? " scored" : ""}`}>
+                    {h.score} PTS
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       <div className="button-row">
         {!systemRunning ? (

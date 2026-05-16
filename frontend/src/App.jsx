@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import CameraPanel from "./components/CameraPanel";
 import ControlPanel from "./components/ControlPanel";
+import BottomExposureBar from "./components/BottomExposureBar";
 import SavedHitsGallery from "./components/SavedHitsGallery";
 import ScorePanel from "./components/ScorePanel";
 import StatusBar from "./components/StatusBar";
@@ -68,6 +69,7 @@ const initialFeed = {
   status: "idle",
   hit_detected: false,
   bbox: null,
+  all_hits: [],
   last_score: 0,
   total_score: 0,
   tries: 0,
@@ -79,6 +81,7 @@ const initialFeed = {
   hit_center: null,
   target_center: null,
   offset_from_center: null,
+  exposure_bias: 0,
 };
 
 export default function App() {
@@ -89,6 +92,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [feed, setFeed] = useState(initialFeed);
+  const [drawingMode, setDrawingMode] = useState(false);
+  const [savedRoi, setSavedRoi] = useState(null);
   const [galleryOpen, setGalleryOpen] = useState(false);
   const wsRef = useRef(null);
   const reconnectRef = useRef(null);
@@ -199,6 +204,29 @@ export default function App() {
     setSavedIpCameras((prev) => prev.filter((c) => c.id !== id));
   };
 
+  const handleRoiDrawn = async (roi) => {
+    setDrawingMode(false);
+    setSavedRoi(roi);
+    try {
+      const res = await fetch(`${API_BASE}/set_roi`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(roi),
+      });
+      const data = await res.json();
+      if (data.status !== "ok") alert(data.message || "Failed to set zone");
+    } catch (err) {
+      alert(err.message || "Network error");
+    }
+  };
+
+  const clearRoi = async () => {
+    setSavedRoi(null);
+    try {
+      await fetch(`${API_BASE}/clear_roi`, { method: "POST" });
+    } catch {}
+  };
+
   const callApi = async (path, body) => {
     setBusy(true);
     const c = new AbortController();
@@ -274,6 +302,7 @@ export default function App() {
                 frame: "",
                 hit_detected: false,
                 bbox: null,
+                all_hits: [],
                 target_type: "unknown",
                 actual_resolution: "",
                 motion: 0,
@@ -281,12 +310,14 @@ export default function App() {
                 hit_center: null,
                 target_center: null,
                 offset_from_center: null,
+                exposure_bias: 0,
               }));
             }
           }}
           onCheckNow={() => callApi("/check_now")}
           busy={busy}
           systemRunning={systemRunning}
+          allHits={feed.all_hits}
         />
 
         <CameraPanel
@@ -298,6 +329,10 @@ export default function App() {
           hitDetected={feed.hit_detected}
           targetType={feed.target_type}
           offsetFromCenter={feed.offset_from_center}
+          allHits={feed.all_hits}
+          drawingMode={drawingMode}
+          savedRoi={savedRoi}
+          onRoiDrawn={handleRoiDrawn}
         />
       </div>
 
@@ -309,6 +344,19 @@ export default function App() {
         stable={feed.stable}
         systemRunning={systemRunning}
         offsetFromCenter={feed.offset_from_center}
+        lastScore={feed.last_score}
+        totalScore={feed.total_score}
+      />
+
+      <BottomExposureBar
+        apiBase={API_BASE}
+        systemRunning={systemRunning}
+        canCaptureReference={systemRunning && feed.status === "monitoring"}
+        exposureBiasFromFeed={feed.exposure_bias}
+        drawingMode={drawingMode}
+        savedRoi={savedRoi}
+        onSetZone={() => setDrawingMode((m) => !m)}
+        onClearZone={clearRoi}
       />
 
       <SavedHitsGallery

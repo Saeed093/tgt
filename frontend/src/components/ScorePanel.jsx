@@ -11,6 +11,8 @@ export default function ScorePanel({
   stable,
   systemRunning,
   offsetFromCenter,
+  lastScore,
+  totalScore,
 }) {
   const statusText = !systemRunning
     ? "OFFLINE"
@@ -42,6 +44,18 @@ export default function ScorePanel({
         <span className="score-label">MISSES</span>
         <span className="score-value big">
           {String(misses).padStart(3, "0")}
+        </span>
+      </div>
+      <div className="score-cell">
+        <span className="score-label">LAST CHK</span>
+        <span className="score-value accent">
+          {lastScore != null ? String(lastScore).padStart(3, "0") : "—"}
+        </span>
+      </div>
+      <div className="score-cell">
+        <span className="score-label">TOTAL</span>
+        <span className="score-value accent">
+          {totalScore != null ? String(totalScore).padStart(4, "0") : "—"}
         </span>
       </div>
       <div className="score-cell">

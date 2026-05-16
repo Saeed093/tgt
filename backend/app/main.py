@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from .camera_manager import CameraManager
-from .schemas import StartRequest, StartResponse, StatusResponse
+from .schemas import ExposureRequest, RoiRequest, StartRequest, StartResponse, StatusResponse
 
 _SESSION_DIR_RE = re.compile(r"^session_\d{8}_\d{6}$")
 _GALLERY_FILE_RE = re.compile(r"^[\w.-]+$")
@@ -45,6 +45,34 @@ async def stop_system() -> StartResponse:
 @app.post("/check_now", response_model=StartResponse)
 async def check_now() -> StartResponse:
     ok, message = camera_manager.request_check()
+    status = "ok" if ok else "error"
+    return StartResponse(status=status, message=message)
+
+
+@app.post("/exposure", response_model=StartResponse)
+async def set_exposure(payload: ExposureRequest) -> StartResponse:
+    ok, message = camera_manager.set_manual_exposure(payload.bias)
+    status = "ok" if ok else "error"
+    return StartResponse(status=status, message=message)
+
+
+@app.post("/capture_reference", response_model=StartResponse)
+async def capture_reference() -> StartResponse:
+    ok, message = camera_manager.request_reference_snap()
+    status = "ok" if ok else "error"
+    return StartResponse(status=status, message=message)
+
+
+@app.post("/set_roi", response_model=StartResponse)
+async def set_roi(payload: RoiRequest) -> StartResponse:
+    ok, message = camera_manager.set_manual_roi(payload.x, payload.y, payload.w, payload.h)
+    status = "ok" if ok else "error"
+    return StartResponse(status=status, message=message)
+
+
+@app.post("/clear_roi", response_model=StartResponse)
+async def clear_roi() -> StartResponse:
+    ok, message = camera_manager.clear_manual_roi()
     status = "ok" if ok else "error"
     return StartResponse(status=status, message=message)
 
@@ -103,6 +131,7 @@ async def ws_feed(websocket: WebSocket) -> None:
                     "hit_center": state.last_hit_center,
                     "target_center": state.last_target_center,
                     "offset_from_center": state.last_offset_px,
+                    "exposure_bias": camera_manager.get_exposure_bias(),
                 }
             await websocket.send_json(payload)
             await asyncio.sleep(0.05)

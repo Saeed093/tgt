@@ -48,6 +48,56 @@ class ScoreEngine:
             return zones[0]["center"]
         return (0.5, 0.5)
 
+    def score_hits_batch(
+        self,
+        centers: list[tuple[int, int]],
+        frame_shape: tuple[int, int, int],
+        target_type: str,
+    ) -> list[dict]:
+        """Score multiple hits from a single Check Now press.
+
+        Increments tries by 1 and hits by the number of detected impacts.
+        Returns a list of per-hit result dicts (same keys as score_hit).
+        """
+        if not centers:
+            return []
+
+        h, w = frame_shape[:2]
+        results = []
+        batch_score = 0
+
+        for center in centers:
+            nx, ny = center[0] / max(w, 1), center[1] / max(h, 1)
+            score = 0
+            for zone in self.zones.get(target_type, []):
+                zx, zy = zone["center"]
+                distance = hypot(nx - zx, ny - zy)
+                if distance <= zone["radius"]:
+                    score = max(score, int(zone["score"]))
+
+            tc_norm = self.get_target_center(target_type)
+            tc_px = (int(tc_norm[0] * w), int(tc_norm[1] * h))
+            offset_px = (center[0] - tc_px[0], center[1] - tc_px[1])
+            offset_norm = (round(nx - tc_norm[0], 4), round(ny - tc_norm[1], 4))
+            batch_score += score
+            results.append({
+                "score": score,
+                "hit_center_px": list(center),
+                "target_center_px": list(tc_px),
+                "offset_px": list(offset_px),
+                "offset_norm": list(offset_norm),
+            })
+
+        self.state.tries += 1
+        self.state.hits += len(centers)
+        self.state.last_score = sum(r["score"] for r in results)
+        self.state.total_score += batch_score
+        self.state.hit_status = "hit"
+        self.state.last_hit_center = results[0]["hit_center_px"]
+        self.state.last_target_center = results[0]["target_center_px"]
+        self.state.last_offset_px = results[0]["offset_px"]
+        return results
+
     def record_miss(self) -> None:
         """Record a Check-Now attempt where the detector found nothing new."""
         self.state.tries += 1

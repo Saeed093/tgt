@@ -63,7 +63,7 @@ body::before {
   width: 100vw;
   padding: 12px 18px;
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto 1fr auto auto;
   gap: 10px;
   overflow: hidden;
 }
@@ -243,11 +243,28 @@ body::before {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
 }
 
 .control-body {
   display: grid;
   gap: 12px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.control-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.control-body::-webkit-scrollbar-thumb {
+  background: var(--line-bright);
+}
+
+.button-row {
+  flex-shrink: 0;
 }
 
 .field {
@@ -534,6 +551,29 @@ select {
   object-fit: contain;
   image-rendering: -webkit-optimize-contrast;
   filter: contrast(1.04) saturate(1.05);
+  user-select: none;
+}
+
+.camera-stage.drawing-mode {
+  cursor: crosshair;
+}
+
+/* ROI overlay SVG — positioned inline to exactly cover the rendered image */
+.roi-overlay {
+  pointer-events: none;
+}
+
+.roi-saved {
+  fill: rgba(124, 255, 178, 0.08);
+  stroke: var(--accent);
+  stroke-width: 0.004;
+  stroke-dasharray: 0.012 0.008;
+}
+
+.roi-drawing {
+  fill: rgba(255, 200, 90, 0.10);
+  stroke: var(--amber);
+  stroke-width: 0.004;
 }
 
 .camera-placeholder {
@@ -731,6 +771,18 @@ select {
   font-weight: 600;
 }
 
+.chip-draw {
+  color: var(--amber);
+  border-color: var(--amber);
+  box-shadow: 0 0 10px rgba(255, 200, 90, 0.3);
+  animation: drawPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes drawPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
 .hit-overlay {
   position: absolute;
   bottom: 24px;
@@ -758,9 +810,10 @@ select {
 
 .score-panel {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 14px;
-  padding: 18px 22px;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 12px;
+  padding: 12px 18px;
+  flex-shrink: 0;
 }
 
 .score-cell {
@@ -843,6 +896,110 @@ select {
 @keyframes hitBeat {
   0%   { transform: scale(1.15); }
   100% { transform: scale(1); }
+}
+
+/* ---------------- Bottom exposure dock ---------------- */
+
+.bottom-exposure-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 18px;
+  padding: 8px 14px;
+  background: linear-gradient(180deg, var(--bg-2), var(--bg-1));
+  border: 1px solid var(--line);
+  box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.35);
+  flex-shrink: 0;
+}
+
+.bottom-exposure-group {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 12px;
+  min-width: 200px;
+}
+
+.bottom-exposure-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.28em;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.bottom-exposure-hint {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: var(--ink-dim);
+  white-space: nowrap;
+}
+
+.bottom-exposure-slider {
+  flex: 1;
+  min-width: 120px;
+  max-width: 420px;
+  height: 6px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.bottom-exposure-slider:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.bottom-exposure-value {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  min-width: 3ch;
+  text-align: right;
+  color: var(--ink);
+}
+
+.bottom-exposure-value.is-pending {
+  color: var(--amber);
+}
+
+.bottom-zone-group {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.bottom-ref-btn {
+  flex: 0 0 auto;
+  min-width: 138px;
+  padding: 8px 12px;
+  letter-spacing: 0.18em;
+  border-color: var(--line-bright);
+  color: var(--amber);
+  box-shadow: inset 0 0 14px rgba(255, 200, 90, 0.08),
+    0 0 12px rgba(255, 200, 90, 0.12);
+}
+
+.bottom-ref-btn:hover:not(:disabled) {
+  background: var(--amber-soft);
+}
+
+.bottom-ref-btn.is-active {
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: inset 0 0 18px rgba(124, 255, 178, 0.18),
+    0 0 18px rgba(124, 255, 178, 0.35);
+}
+
+.bottom-ref-btn.danger-btn {
+  color: var(--danger);
+  border-color: var(--danger);
+  box-shadow: inset 0 0 12px rgba(255, 77, 77, 0.08);
+}
+
+.bottom-ref-btn.danger-btn:hover:not(:disabled) {
+  background: var(--danger-soft);
 }
 
 /* ---------------- Saved hits gallery modal ---------------- */
@@ -959,4 +1116,178 @@ select {
   line-height: 1.3;
   max-height: 2.6em;
   overflow: hidden;
+}
+
+/* ---- Hits List Panel ---- */
+
+.hits-list-panel {
+  padding: 6px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.hits-check-total {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--amber);
+  letter-spacing: 0.12em;
+}
+
+.hits-list-scroll {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 3px;
+}
+
+.hits-list-scroll::-webkit-scrollbar {
+  height: 3px;
+}
+.hits-list-scroll::-webkit-scrollbar-track {
+  background: var(--bg-1);
+}
+.hits-list-scroll::-webkit-scrollbar-thumb {
+  background: var(--line-bright);
+  border-radius: 2px;
+}
+
+.hit-card {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--line-bright);
+  padding: 5px 12px;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+
+.hit-card-index {
+  color: var(--danger);
+  font-weight: 700;
+  font-size: 12px;
+  min-width: 2.2em;
+}
+
+.hit-card-coord {
+  color: var(--ink);
+}
+
+.hit-card-offset {
+  color: var(--ink-dim);
+}
+
+.hit-card-score {
+  font-weight: 700;
+  min-width: 4em;
+  text-align: right;
+}
+
+.hit-card-score.scored {
+  color: var(--accent);
+}
+
+.hit-card-score.miss-score {
+  color: var(--ink-dim);
+}
+
+/* ---- Hit index labels on image ---- */
+
+.hit-label-text {
+  font-family: var(--mono);
+  font-size: 0.022px;   /* SVG viewport is 0-1, so ~2.2% of image height */
+  font-weight: 700;
+  fill: var(--danger);
+  paint-order: stroke fill;
+  stroke: #000;
+  stroke-width: 0.002px;
+  letter-spacing: 0;
+}
+
+/* ---- Hits in ControlPanel ---- */
+
+.hits-in-panel {
+  flex-shrink: 0;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.hits-in-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.hits-in-panel-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  color: var(--ink-dim);
+}
+
+.hits-in-panel-total {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--amber);
+  letter-spacing: 0.1em;
+}
+
+.hits-in-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.hits-in-panel-list::-webkit-scrollbar {
+  width: 4px;
+}
+.hits-in-panel-list::-webkit-scrollbar-thumb {
+  background: var(--line-bright);
+}
+
+.hit-row {
+  display: grid;
+  grid-template-columns: 2.2em 1fr 1fr auto;
+  gap: 6px;
+  align-items: center;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.hit-row-index {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.hit-row-coord {
+  color: var(--ink);
+}
+
+.hit-row-offset {
+  color: var(--ink-dim);
+}
+
+.hit-row-score {
+  color: var(--ink-dim);
+  text-align: right;
+  font-weight: 700;
+}
+
+.hit-row-score.scored {
+  color: var(--accent);
 }

@@ -38,6 +38,17 @@ STREAM_MAX_EDGE = 1280
 STREAM_JPEG_QUALITY = 84
 DISK_JPEG_QUALITY = 93
 
+# When the global mean luma is above this, scale the frame down slightly
+# so IP streams / auto-exposure USB frames are not blown out.
+OVEREXPOSE_MEAN_LUMA_GATE = 120.0
+OVEREXPOSE_TARGET_MEAN = 105.0
+
+# USB (DirectShow / MSMF): best-effort manual-ish exposure — values are
+# driver-specific; we log what stuck.
+USB_EXPOSURE_RELATIVE = -10.0
+USB_GAIN = 8.0
+USB_BRIGHTNESS = 118.0
+
 # Network-stream reader tuning.
 NETWORK_READ_TIMEOUT_SEC = 4.0          # block in main loop waiting for a fresh frame
 NETWORK_RECONNECT_AFTER_SEC = 3.0       # if reader sees no frame for this long → reconnect
@@ -143,6 +154,7 @@ class CameraManager:
         self.last_hit_ts = 0.0
         self._sticky_boxes: list[list[int]] | None = None
         self._last_hit_detail: dict | None = None
+        self._all_hits_detail: list[dict] = []
 
         self.actual_resolution: str = ""
         self.motion: float = 0.0
@@ -154,6 +166,12 @@ class CameraManager:
 
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        # -1 = darker, +1 = brighter (software gain on every frame; USB also nudges CAP_PROP_EXPOSURE).
+        self._manual_exposure_bias = 0.0
+        self._snap_reference_requested = False
+        # Normalised (0-1) ROI drawn by the user on the live feed.
+        # None means auto-segmentation; set via /set_roi.
+        self._manual_roi: tuple[float, float, float, float] | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -176,12 +194,17 @@ class CameraManager:
         self.last_hit_ts = 0.0
         self._sticky_boxes = None
         self._last_hit_detail = None
+        self._all_hits_detail = []
+        self.hit_detector.clear_mask_cache()
         self.actual_resolution = ""
         self.motion = 0.0
         self.stable = False
         self._prev_gray_small = None
         self._last_motion_ts = time.time()
         self._manual_check_pending = False
+        self._manual_exposure_bias = 0.0
+        self._snap_reference_requested = False
+        self._manual_roi = None
         self.status = "starting"
         self.running = True
 
@@ -217,11 +240,16 @@ class CameraManager:
         self.target_type = "unknown"
         self._sticky_boxes = None
         self._last_hit_detail = None
+        self._all_hits_detail = []
         self.actual_resolution = ""
         self.motion = 0.0
         self.stable = False
         self._prev_gray_small = None
         self._manual_check_pending = False
+        self._manual_exposure_bias = 0.0
+        self._snap_reference_requested = False
+        self._manual_roi = None
+        self.hit_detector.clear_mask_cache()
         self._publish_idle_feed()
         log.info("Camera stopped")
         return True, "Camera stopped"
@@ -252,7 +280,61 @@ class CameraManager:
             "actual_resolution": self.actual_resolution,
             "motion": self.motion,
             "stable": self.stable,
+            "exposure_bias": round(float(self._manual_exposure_bias), 4),
         }
+
+    def get_exposure_bias(self) -> float:
+        return float(self._manual_exposure_bias)
+
+    def set_manual_exposure(self, bias: float) -> tuple[bool, str]:
+        b = max(-1.0, min(1.0, float(bias)))
+        with self._lock:
+            self._manual_exposure_bias = b
+        cap = self.capture
+        src = self.camera_source
+        if cap is not None and src is not None:
+            parsed = self._parse_source(str(src))
+            if not self._is_network_stream(parsed):
+                ex = getattr(cv2, "CAP_PROP_EXPOSURE", None)
+                if ex is not None:
+                    mapped = float(USB_EXPOSURE_RELATIVE) + b * 7.0
+                    try:
+                        cap.set(ex, mapped)
+                    except Exception:
+                        pass
+        return True, f"Exposure bias {b:+.2f}"
+
+    def set_manual_roi(
+        self, nx: float, ny: float, nw: float, nh: float
+    ) -> tuple[bool, str]:
+        """Set a normalised (0-1) ROI; resets the mask cache so it is rebuilt
+        from the stored reference at the next check."""
+        nx = max(0.0, min(1.0, float(nx)))
+        ny = max(0.0, min(1.0, float(ny)))
+        nw = max(0.01, min(1.0 - nx, float(nw)))
+        nh = max(0.01, min(1.0 - ny, float(nh)))
+        self._manual_roi = (nx, ny, nw, nh)
+        self.hit_detector.clear_mask_cache()
+        log.info("Manual ROI set: x=%.3f y=%.3f w=%.3f h=%.3f", nx, ny, nw, nh)
+        return True, f"ROI set ({nx:.2f},{ny:.2f}) {nw:.2f}×{nh:.2f}"
+
+    def clear_manual_roi(self) -> tuple[bool, str]:
+        self._manual_roi = None
+        self.hit_detector.clear_mask_cache()
+        log.info("Manual ROI cleared — reverting to auto-segmentation")
+        return True, "ROI cleared"
+
+    def get_manual_roi(self) -> tuple[float, float, float, float] | None:
+        return self._manual_roi
+
+    def request_reference_snap(self) -> tuple[bool, str]:
+        if not self.running:
+            return False, "System not running"
+        if self.status != "monitoring":
+            return False, "Wait until monitoring is active"
+        self._snap_reference_requested = True
+        log.info("Manual reference snap requested")
+        return True, "New reference will be taken from the next frame"
 
     def get_latest_payload(self) -> dict | None:
         """Return latest payload, encoding the BGR frame on demand.
@@ -296,6 +378,78 @@ class CameraManager:
         except Exception:
             pass
         return False, None
+
+    def _compensate_overexposure(self, frame: np.ndarray | None) -> np.ndarray | None:
+        """Auto tone-down very bright frames, then apply manual exposure bias."""
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return frame
+        with self._lock:
+            bias = float(self._manual_exposure_bias)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        m = float(np.mean(gray))
+        out = frame.astype(np.float32)
+        if m > OVEREXPOSE_MEAN_LUMA_GATE:
+            scale = min(0.98, OVEREXPOSE_TARGET_MEAN / m)
+            out = out * scale
+        if abs(bias) > 1e-5:
+            # bias +1 → brighter, -1 → darker
+            out = out * (1.0 + 0.55 * bias)
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    def _configure_usb_exposure(self, cap: cv2.VideoCapture) -> None:
+        """Best-effort lower exposure / gain on USB webcams (driver-specific)."""
+        for _ in range(8):
+            self._safe_read(cap)
+
+        notes: list[str] = []
+        ae = getattr(cv2, "CAP_PROP_AUTO_EXPOSURE", None)
+        if ae is not None:
+            for val in (0.25, 1.0, 0.0):
+                try:
+                    if cap.set(ae, float(val)):
+                        notes.append(f"auto_exposure={val}")
+                        break
+                except Exception:
+                    pass
+
+        ex = getattr(cv2, "CAP_PROP_EXPOSURE", None)
+        if ex is not None:
+            try:
+                cap.set(ex, float(USB_EXPOSURE_RELATIVE))
+                notes.append(f"exposure={USB_EXPOSURE_RELATIVE}")
+            except Exception:
+                pass
+
+        gn = getattr(cv2, "CAP_PROP_GAIN", None)
+        if gn is not None:
+            try:
+                cap.set(gn, float(USB_GAIN))
+                notes.append(f"gain={USB_GAIN}")
+            except Exception:
+                pass
+
+        br = getattr(cv2, "CAP_PROP_BRIGHTNESS", None)
+        if br is not None:
+            try:
+                cap.set(br, float(USB_BRIGHTNESS))
+                notes.append(f"brightness={USB_BRIGHTNESS}")
+            except Exception:
+                pass
+
+        for _ in range(4):
+            self._safe_read(cap)
+
+        got_ex: float | None = None
+        if ex is not None:
+            try:
+                got_ex = float(cap.get(ex))
+            except Exception:
+                got_ex = None
+        log.info(
+            "USB exposure tune (%s) | CAP_PROP_EXPOSURE readback=%s",
+            ", ".join(notes) if notes else "no props accepted",
+            got_ex,
+        )
 
     def _open_camera(self, source: str) -> cv2.VideoCapture | None:
         """Open camera with DSHOW on Windows (fastest for USB) and negotiate max resolution."""
@@ -491,6 +645,7 @@ class CameraManager:
             if actual_w >= w * 0.9 and actual_h >= h * 0.9:
                 self.actual_resolution = f"{actual_w}x{actual_h}"
                 log.info("Resolution locked: %s", self.actual_resolution)
+                self._configure_usb_exposure(cap)
                 return
 
         # Fallback: accept whatever the camera is currently outputting.
@@ -499,6 +654,8 @@ class CameraManager:
             ah, aw = frame.shape[:2]
             self.actual_resolution = f"{aw}x{ah}"
             log.info("Fallback resolution: %s", self.actual_resolution)
+
+        self._configure_usb_exposure(cap)
 
     # ------------------------------------------------------------------
     # Encoding / persistence helpers
@@ -532,10 +689,36 @@ class CameraManager:
         if path:
             cv2.imwrite(str(path), frame)
 
+    def _save_debug_crops(self, prefix: str, debug: dict | None) -> None:
+        """Write before/after greyscale crops and diff/mask images.
+
+        Files written (all single-channel JPEG, same folder as the session):
+          <prefix>_before_gray.jpg  – reference crop
+          <prefix>_after_gray.jpg   – current-frame crop
+          <prefix>_diff.jpg         – absolute-difference image
+          <prefix>_change_mask.jpg  – thresholded change mask
+        """
+        if not debug:
+            return
+        jpg_opts = [int(cv2.IMWRITE_JPEG_QUALITY), DISK_JPEG_QUALITY]
+        for key, suffix in (
+            ("before_gray", "before_gray"),
+            ("after_gray", "after_gray"),
+            ("diff", "diff"),
+            ("change_mask", "change_mask"),
+        ):
+            img = debug.get(key)
+            if img is None:
+                continue
+            path = self.session_manager.path_for(f"{prefix}_{suffix}.jpg")
+            if path:
+                cv2.imwrite(str(path), img, jpg_opts)
+
     def _save_hit_images(self, frame, annotated, tries: int) -> None:
         hit_path = self.session_manager.path_for(f"hit_{tries:03d}.jpg")
         annotated_path = self.session_manager.path_for(f"hit_{tries:03d}_annotated.jpg")
         latest_path = self.session_manager.path_for("annotated_latest.jpg")
+        latest_check = self.session_manager.path_for("latest_check.jpg")
         jpg_opts = [int(cv2.IMWRITE_JPEG_QUALITY), DISK_JPEG_QUALITY]
         if hit_path:
             cv2.imwrite(str(hit_path), frame, jpg_opts)
@@ -543,6 +726,26 @@ class CameraManager:
             cv2.imwrite(str(annotated_path), annotated, jpg_opts)
         if latest_path:
             cv2.imwrite(str(latest_path), annotated, jpg_opts)
+        if latest_check:
+            cv2.imwrite(str(latest_check), annotated, jpg_opts)
+        self._save_debug_crops(f"hit_{tries:03d}", self.hit_detector.last_debug)
+
+    def _save_miss_image(self, frame, annotated, tries: int) -> None:
+        miss_path = self.session_manager.path_for(f"miss_{tries:03d}.jpg")
+        miss_annotated = self.session_manager.path_for(
+            f"miss_{tries:03d}_annotated.jpg"
+        )
+        latest_check = self.session_manager.path_for("latest_check.jpg")
+        jpg_opts = [int(cv2.IMWRITE_JPEG_QUALITY), DISK_JPEG_QUALITY]
+        if miss_path:
+            cv2.imwrite(str(miss_path), frame, jpg_opts)
+        if miss_annotated:
+            cv2.imwrite(str(miss_annotated), annotated, jpg_opts)
+        if latest_check:
+            cv2.imwrite(str(latest_check), annotated, jpg_opts)
+        self._save_debug_crops(
+            f"miss_{self.score_engine.state.tries:03d}", self.hit_detector.last_debug
+        )
 
     def _save_hit_data(self, detection: dict, hit_result: dict, tries: int) -> None:
         record = {
@@ -553,6 +756,40 @@ class CameraManager:
             "offset_from_center_px": hit_result["offset_px"],
             "offset_from_center_norm": hit_result["offset_norm"],
             "score": hit_result["score"],
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+
+        per_hit = self.session_manager.path_for(f"hit_{tries:03d}.json")
+        if per_hit:
+            per_hit.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+        summary = self.session_manager.path_for("session_hits.json")
+        if summary:
+            existing: list = []
+            if summary.exists():
+                try:
+                    existing = json.loads(summary.read_text(encoding="utf-8"))
+                except Exception:
+                    existing = []
+            existing.append(record)
+            summary.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+
+    def _save_hit_data_batch(self, all_hits: list[dict], tries: int) -> None:
+        """Persist JSON for all hits detected in a single Check Now press."""
+        record = {
+            "try": tries,
+            "hit_count": len(all_hits),
+            "hits": [
+                {
+                    "index": h["index"],
+                    "bbox": h["bbox"],
+                    "center_px": h["center"],
+                    "score": h["score"],
+                    "offset_from_center_px": h["offset_px"],
+                }
+                for h in all_hits
+            ],
+            "total_score_this_check": sum(h["score"] for h in all_hits),
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -583,6 +820,7 @@ class CameraManager:
             "status": self.status,
             "hit_detected": hit_detected,
             "bbox": bbox,
+            "all_hits": list(self._all_hits_detail),
             "last_score": state.last_score,
             "total_score": state.total_score,
             "tries": state.tries,
@@ -594,6 +832,8 @@ class CameraManager:
             "hit_center": state.last_hit_center,
             "target_center": state.last_target_center,
             "offset_from_center": state.last_offset_px,
+            "exposure_bias": round(float(self._manual_exposure_bias), 4),
+            "manual_roi": list(self._manual_roi) if self._manual_roi else None,
         }
         with self._lock:
             self.latest_payload = payload
@@ -607,6 +847,7 @@ class CameraManager:
                 "status": "idle",
                 "hit_detected": False,
                 "bbox": None,
+                "all_hits": [],
                 "last_score": state.last_score,
                 "total_score": state.total_score,
                 "tries": state.tries,
@@ -618,6 +859,8 @@ class CameraManager:
                 "hit_center": None,
                 "target_center": None,
                 "offset_from_center": None,
+                "exposure_bias": round(float(self._manual_exposure_bias), 4),
+                "manual_roi": list(self._manual_roi) if self._manual_roi else None,
             }
 
     # ------------------------------------------------------------------
@@ -637,11 +880,35 @@ class CameraManager:
 
     def _update_motion(self, frame: np.ndarray) -> float:
         gray_small = self._to_motion_gray(frame)
+        mask_full = self.hit_detector.last_target_mask
+        if (
+            mask_full is None
+            or self.reference_frame is None
+            or mask_full.shape[:2] != frame.shape[:2]
+        ):
+            if self._prev_gray_small is None or self._prev_gray_small.shape != gray_small.shape:
+                self._prev_gray_small = gray_small
+                return 0.0
+            diff = cv2.absdiff(gray_small, self._prev_gray_small)
+            score = float(np.mean(diff))
+            self._prev_gray_small = gray_small
+            return score
+
+        mask_small = cv2.resize(
+            mask_full,
+            (gray_small.shape[1], gray_small.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
         if self._prev_gray_small is None or self._prev_gray_small.shape != gray_small.shape:
             self._prev_gray_small = gray_small
             return 0.0
         diff = cv2.absdiff(gray_small, self._prev_gray_small)
-        score = float(np.mean(diff))
+        m = mask_small > 127
+        n = int(np.count_nonzero(m))
+        if n < 80:
+            score = float(np.mean(diff))
+        else:
+            score = float(np.sum(diff.astype(np.float32) * m.astype(np.float32)) / n)
         self._prev_gray_small = gray_small
         return score
 
@@ -670,6 +937,8 @@ class CameraManager:
             if not ok or frame is None:
                 time.sleep(0.03)
                 continue
+
+            frame = self._compensate_overexposure(frame)
 
             small = self._to_motion_gray(frame)
             if prev_small is None:
@@ -741,6 +1010,7 @@ class CameraManager:
             while self.running and (time.time() - warmup_start) < 2.0:
                 ok, frame = self._pipeline_read()
                 if ok and frame is not None:
+                    frame = self._compensate_overexposure(frame)
                     self.motion = self._update_motion(frame)
                     self._push_payload(frame)
                 time.sleep(0.04)
@@ -758,6 +1028,7 @@ class CameraManager:
             self.reference_frame = ref
             self.reference_saved = True
             self._save_reference(self.reference_frame)
+            self.hit_detector._get_target_mask(self.reference_frame)
 
             if self.target_mode in ("figure_1", "figure_2"):
                 self.target_type = self.target_mode
@@ -827,6 +1098,19 @@ class CameraManager:
 
                 _consecutive_failures = 0
 
+                frame = self._compensate_overexposure(frame)
+
+                if self._snap_reference_requested:
+                    self._snap_reference_requested = False
+                    self.reference_frame = frame.copy()
+                    self._save_reference(self.reference_frame)
+                    self.hit_detector.clear_mask_cache()
+                    self.hit_detector._get_target_mask(self.reference_frame)
+                    self._sticky_boxes = None
+                    self._all_hits_detail = []
+                    self._prev_gray_small = None
+                    log.info("Reference image updated (manual snap)")
+
                 now = time.time()
                 frame_counter += 1
                 if frame_counter % 3 == 0:
@@ -838,32 +1122,50 @@ class CameraManager:
 
                 annotated = frame.copy()
                 hit_detected = False
+                manual_miss_captured: dict | None = None
+
+                if self.reference_frame is not None:
+                    if self.hit_detector.last_target_mask is None:
+                        self.hit_detector._get_target_mask(self.reference_frame)
+                    outline = self.hit_detector.last_target_outline
+                    if outline is not None:
+                        cv2.drawContours(annotated, [outline], -1, (0, 255, 0), 2)
 
                 if self._manual_check_pending and self.reference_frame is not None:
                     self._manual_check_pending = False
-                    hits = self.hit_detector.detect_hits(self.reference_frame, frame)
+                    hits = self.hit_detector.detect_hits(
+                        self.reference_frame, frame, manual_roi=self._manual_roi
+                    )
                     if hits:
-                        best = hits[0]
                         hit_detected = True
-                        bbox_entry = list(map(int, best["bbox"]))
-                        self._sticky_boxes = [bbox_entry]
-                        center = tuple(best["center"])
-                        hit_result = self.score_engine.score_hit(
-                            center, frame.shape, self.target_type
+                        centers = [tuple(h["center"]) for h in hits]
+                        hit_results = self.score_engine.score_hits_batch(
+                            centers, frame.shape, self.target_type
                         )
-                        score = hit_result["score"]
+                        self._sticky_boxes = [list(map(int, h["bbox"])) for h in hits]
+                        self._all_hits_detail = [
+                            {
+                                "index": i + 1,
+                                "bbox": list(map(int, h["bbox"])),
+                                "center": list(map(int, h["center"])),
+                                "score": r["score"],
+                                "offset_px": r["offset_px"],
+                            }
+                            for i, (h, r) in enumerate(zip(hits, hit_results))
+                        ]
                         self.last_hit_ts = now
-                        self.reference_frame = frame.copy()
-                        self._last_hit_detail = hit_result
+                        self._last_hit_detail = hit_results[0]
                         log.info(
-                            "HIT  bbox=%s  center=%s  score=%d  total=%d  offset=(%+d,%+d)",
-                            best["bbox"], best["center"], score,
+                            "HITS %d  total_score=%d",
+                            len(hits),
                             self.score_engine.state.total_score,
-                            hit_result["offset_px"][0], hit_result["offset_px"][1],
                         )
                     else:
                         self.score_engine.record_miss()
-                        self.reference_frame = frame.copy()
+                        manual_miss_captured = {
+                            "frame": frame.copy(),
+                            "annotated": annotated.copy(),
+                        }
                         log.info(
                             "MISS  tries=%d  misses=%d",
                             self.score_engine.state.tries,
@@ -885,11 +1187,17 @@ class CameraManager:
                     self._save_hit_images(
                         frame, annotated, self.score_engine.state.tries
                     )
-                    self._save_hit_data(
-                        best, self._last_hit_detail, self.score_engine.state.tries
+                    self._save_hit_data_batch(
+                        self._all_hits_detail, self.score_engine.state.tries
+                    )
+                elif manual_miss_captured:
+                    self._save_miss_image(
+                        manual_miss_captured["frame"],
+                        manual_miss_captured["annotated"],
+                        self.score_engine.state.tries,
                     )
 
-                sticky_primary = self._sticky_boxes[-1] if self._sticky_boxes else None
+                sticky_primary = self._sticky_boxes[0] if self._sticky_boxes else None
                 self._push_payload(annotated, hit_detected, sticky_primary)
 
                 # USB cameras need a small sleep so we don't busy-loop the CPU.
